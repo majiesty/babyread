@@ -1,0 +1,49 @@
+name: build-ipa
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: 取回代码
+        uses: actions/checkout@v4
+
+      - name: 安装 XcodeGen
+        run: brew install xcodegen
+
+      - name: 生成 Xcode 工程
+        run: xcodegen generate
+
+      - name: 编译（不签名，交给巨魔签）
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project BabyRead.xcodeproj \
+            -scheme BabyRead \
+            -sdk iphoneos \
+            -configuration Release \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            build | tail -40
+
+      - name: 打包成 ipa
+        run: |
+          mkdir -p Payload
+          cp -R "build/Build/Products/Release-iphoneos/BabyRead.app" Payload/
+          zip -qry BabyRead.ipa Payload
+          ls -lh BabyRead.ipa
+
+      - name: 上传 ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: BabyRead-ipa
+          path: BabyRead.ipa
