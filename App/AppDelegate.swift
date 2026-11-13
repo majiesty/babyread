@@ -3,6 +3,23 @@ import WebKit
 import AVFoundation
 import Speech
 
+/// 崩溃日志：写到沙盒 Documents，便于排查闪退（不会被系统清理）
+enum CrashLog {
+    static func write(_ s: String) {
+        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let url = dir.appendingPathComponent("babyread-crash.log")
+        let line = "\(Date()) \(s)\n"
+        guard let data = line.data(using: .utf8) else { return }
+        if let h = try? FileHandle(forWritingTo: url) {
+            h.seekToEndOfFile()
+            h.write(data)
+            h.closeFile()
+        } else {
+            try? data.write(to: url)
+        }
+    }
+}
+
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate {
 
@@ -11,13 +28,18 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
 
+        // 未捕获的 ObjC 异常先落盘，便于定位闪退（进程仍会结束，但留下线索）
+        NSSetUncaughtExceptionHandler { ex in
+            CrashLog.write("NSException \(ex.name.rawValue): \(ex.reason ?? "-")")
+        }
+
         // 朗读要能绕过静音键：用 playback 通道，孩子上课时不会被静音开关掐掉
         do {
             try AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio,
                                                            options: [.duckOthers, .mixWithOthers])
             try AVAudioSession.sharedInstance().setActive(true)
         } catch {
-            // 忽略：拿不到音频会话也不影响界面
+            CrashLog.write("audio session init: \(error)")
         }
 
         let window = UIWindow(frame: UIScreen.main.bounds)
@@ -32,11 +54,14 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
     private var webView: WKWebView!
     private let synthesizer = AVSpeechSynthesizer()
+
+    // 语音识别：录音文件 + 事后识别（不用 AVAudioEngine，避免 installTap 抛 ObjC 异常闪退）
     private var recognizer: SFSpeechRecognizer?
-    private var recRequest: SFSpeechAudioBufferRecognitionRequest?
+    private var recorder: AVAudioRecorder?
     private var recTask: SFSpeechRecognitionTask?
-    private let audioEngine = AVAudioEngine()
-    private var srPendingAlts: [String] = []
+    private var recURL: URL?
+    private var listenTimer: Timer?
+    private let maxListenSeconds: TimeInterval = 6.0
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -95,6 +120,8 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     // MARK: - 原生 TTS
 
     func nativeSpeak(text: String, rate: Double, pitch: Double) {
+        // 新的朗读打断旧的，避免排队卡住
+        if synthesizer.isSpeaking { synthesizer.stopSpeaking(at: .immediate) }
         let u = AVSpeechUtterance(string: text)
         u.voice = AVSpeechSynthesisVoice(language: text.contains("。") || text.range(of: "[\\u4e00-\\u9fff]", options: .regularExpression) != nil ? "zh-CN" : "en-US")
         u.rate = Float(max(0.35, min(0.62, rate * 0.55)))
@@ -107,81 +134,147 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         synthesizer.stopSpeaking(at: .immediate)
     }
 
-    // MARK: - 原生语音识别（en-US）
+    // MARK: - 原生语音识别（en-US，录音 → 识别）
 
     func nativeListen() {
+        cancelListening(notify: false)
         let session = AVAudioSession.sharedInstance()
         do {
-            try session.setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker, .duckOthers])
+            try session.setCategory(.playAndRecord, mode: .measurement,
+                                    options: [.defaultToSpeaker, .duckOthers])
             try session.setActive(true, options: .notifyOthersOnDeactivation)
         } catch {
+            CrashLog.write("sr session: \(error)")
             sendSR(["error": "broken"])
             return
         }
         SFSpeechRecognizer.requestAuthorization { [weak self] auth in
             DispatchQueue.main.async {
                 guard let self = self else { return }
-                guard auth == .authorized else { self.sendSR(["error": "broken"]); return }
+                guard auth == .authorized else {
+                    self.restorePlaybackSession()
+                    self.sendSR(["error": "denied"])
+                    return
+                }
                 AVCaptureDevice.requestAccess(for: .audio) { granted in
                     DispatchQueue.main.async {
-                        if granted { self.beginRecognition() } else { self.sendSR(["error": "broken"]) }
+                        guard granted else {
+                            self.restorePlaybackSession()
+                            self.sendSR(["error": "denied"])
+                            return
+                        }
+                        self.startRecording()
                     }
                 }
             }
         }
     }
 
-    private func beginRecognition() {
-        finishRecognition(send: false)
-        if recognizer == nil { recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US")) }
-        guard let rec = recognizer, rec.isAvailable else { sendSR(["error": "broken"]); return }
-
-        recRequest = SFSpeechAudioBufferRecognitionRequest()
-        guard let req = recRequest else { sendSR(["error": "broken"]); return }
-        req.shouldReportPartialResults = true
-
-        let input = audioEngine.inputNode
-        let format = input.outputFormat(forBus: 0)
-        input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-            self?.recRequest?.append(buffer)
-        }
-        audioEngine.prepare()
-        do { try audioEngine.start() } catch {
-            sendSR(["error": "broken"]); return
-        }
-        srPendingAlts = []
-        recTask = rec.recognitionTask(with: req) { [weak self] result, error in
-            guard let self = self else { return }
-            if let r = result {
-                self.srPendingAlts = r.transcriptions.map { $0.formattedString }
-                if r.isFinal { self.finishRecognition(send: true) }
-            } else if error != nil {
-                self.finishRecognition(send: false)
+    private func startRecording() {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("listen-\(Int(Date().timeIntervalSince1970 * 1000)).m4a")
+        try? FileManager.default.removeItem(at: url)
+        let settings: [String: Any] = [
+            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
+            AVSampleRateKey: 16000,
+            AVNumberOfChannelsKey: 1,
+            AVEncoderAudioQualityKey: AVAudioQuality.medium.rawValue
+        ]
+        do {
+            let r = try AVAudioRecorder(url: url, settings: settings)
+            guard r.record() else {
+                throw NSError(domain: "babyread", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "record() returned false"])
             }
+            recorder = r
+            recURL = url
+            listenTimer?.invalidate()
+            listenTimer = Timer.scheduledTimer(withTimeInterval: maxListenSeconds, repeats: false) { [weak self] _ in
+                self?.nativeStopSR()
+            }
+        } catch {
+            CrashLog.write("sr record: \(error)")
+            restorePlaybackSession()
+            sendSR(["error": "broken"])
         }
     }
 
     func nativeStopSR() {
-        recRequest?.endAudio()
-        finishRecognition(send: true)
+        listenTimer?.invalidate()
+        listenTimer = nil
+        guard let rec = recorder else { return }
+        recorder = nil
+        rec.stop()
+        guard let url = recURL else {
+            restorePlaybackSession()
+            sendSR(["error": "no_match"])
+            return
+        }
+        recURL = nil
+        transcribe(url)
     }
 
-    private func finishRecognition(send: Bool) {
-        if audioEngine.isRunning {
-            audioEngine.stop()
-            audioEngine.inputNode.removeTap(onBus: 0)
+    private func transcribe(_ url: URL) {
+        if recognizer == nil {
+            recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
         }
-        recRequest = nil
+        guard let rec = recognizer, rec.isAvailable else {
+            restorePlaybackSession()
+            sendSR(["error": "broken"])
+            try? FileManager.default.removeItem(at: url)
+            return
+        }
+        let req = SFSpeechURLRecognitionRequest(url: url)
+        req.shouldReportPartialResults = false
+
+        var finished = false
+        let finish: ([String]) -> Void = { [weak self] alts in
+            guard let self = self else { return }
+            finished = true
+            self.recTask?.cancel()
+            self.recTask = nil
+            self.restorePlaybackSession()
+            self.sendSR(alts.isEmpty ? ["error": "no_match"] : ["alts": alts])
+            try? FileManager.default.removeItem(at: url)
+        }
+
+        recTask = rec.recognitionTask(with: req) { result, error in
+            DispatchQueue.main.async {
+                guard !finished else { return }
+                if let r = result {
+                    let alts = r.transcriptions.map { $0.formattedString }
+                    if r.isFinal || !alts.isEmpty { finish(alts) }
+                } else if error != nil {
+                    finish([])
+                }
+            }
+        }
+        // 识别超时保护：8 秒没结果按"没听清"处理，页面不会卡住
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
+            if !finished { finish([]) }
+        }
+    }
+
+    private func cancelListening(notify: Bool) {
+        listenTimer?.invalidate()
+        listenTimer = nil
+        if let r = recorder { r.stop() }
+        recorder = nil
         recTask?.cancel()
         recTask = nil
+        if let u = recURL { try? FileManager.default.removeItem(at: u) }
+        recURL = nil
+        if notify { sendSR(["error": "no_match"]) }
+    }
+
+    private func restorePlaybackSession() {
         do {
-            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio, options: [.duckOthers, .mixWithOthers])
-        } catch {}
-        if send {
-            let alts = srPendingAlts
-            sendSR(alts.isEmpty ? ["error": "no_match"] : ["alts": alts])
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio,
+                                                           options: [.duckOthers, .mixWithOthers])
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch {
+            CrashLog.write("session restore: \(error)")
         }
-        srPendingAlts = []
     }
 
     private func sendSR(_ payload: [String: Any]) {
