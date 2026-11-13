@@ -66,7 +66,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create v1.7 BabyRead.ipa \
-            --title "宝宝启蒙跟读 v1.7（巨魔可用 · 安卓老平板适配）" \
-            --notes "页面全面兼容老引擎（Android 5/6 WebView）：ES5 转译 + CSS 降级 + flex 兜底布局。" \
+          gh release create v1.8 BabyRead.ipa \
+            --title "宝宝启蒙跟读 v1.8（巨魔可用）" \
+            --notes "与安卓 v1.8 同一份页面；iPad 布局与功能不变。" \
             2>/dev/null || gh release upload v1.6 BabyRead.ipa --clobber
