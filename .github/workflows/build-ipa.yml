@@ -63,5 +63,4 @@ jobs:
         run: |
           gh release create v1.4 BabyRead.ipa \
             --title "宝宝启蒙跟读 v1.4（巨魔可用）" \
-            --notes "未签名 IPA，TrollStore（巨魔）直接安装。横屏启动，内置全部语音。" \
-            --clobber || gh release upload v1.4 BabyRead.ipa --clobber
+            --notes "未签名 IPA，TrollStore（巨魔）直接安装。横屏启动，内置全部语音。"
