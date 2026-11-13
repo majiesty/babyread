@@ -16,7 +16,7 @@ jobs:
 
       - name: 还原图标（base64 → png）
         run: |
-          base64 -d icon.b64 > App/Assets.xcassets/AppIcon.appiconset/icon-1024.png
+          python3 -c "import base64;open('App/Assets.xcassets/AppIcon.appiconset/icon-1024.png','wb').write(base64.b64decode(open('icon.b64').read()))"
           file App/Assets.xcassets/AppIcon.appiconset/icon-1024.png
 
       - name: 生成内置语音（edge-tts，1032 条）
