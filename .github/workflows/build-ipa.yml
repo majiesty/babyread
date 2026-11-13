@@ -8,11 +8,23 @@ on:
 jobs:
   build:
     runs-on: macos-14
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: 取回代码
         uses: actions/checkout@v4
+
+      - name: 还原图标（base64 → png）
+        run: |
+          base64 -d icon.b64 > App/Assets.xcassets/AppIcon.appiconset/icon-1024.png
+          file App/Assets.xcassets/AppIcon.appiconset/icon-1024.png
+
+      - name: 生成内置语音（edge-tts，1032 条）
+        continue-on-error: true
+        run: |
+          pip3 install --quiet edge-tts
+          python3 scripts/regen_audio.py
+          ls App/www/audio | wc -l
 
       - name: 安装 XcodeGen
         run: brew install xcodegen
@@ -41,9 +53,13 @@ jobs:
           cp -R "build/Build/Products/Release-iphoneos/BabyRead.app" Payload/
           zip -qry BabyRead.ipa Payload
           ls -lh BabyRead.ipa
+          unzip -l BabyRead.ipa | grep -c "\.mp3" || true
 
-      - name: 上传 ipa
-        uses: actions/upload-artifact@v4
-        with:
-          name: BabyRead-ipa
-          path: BabyRead.ipa
+      - name: 发布到 Release（供匿名下载）
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create v1.4 BabyRead.ipa \
+            --title "宝宝启蒙跟读 v1.4（巨魔可用）" \
+            --notes "未签名 IPA，TrollStore（巨魔）直接安装。横屏启动，内置全部语音。" \
+            --clobber || gh release upload v1.4 BabyRead.ipa --clobber

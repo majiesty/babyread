@@ -214,7 +214,8 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
     override var prefersStatusBarHidden: Bool { true }
     override var prefersHomeIndicatorAutoHidden: Bool { true }
-    override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .all }
+    // 与安卓版一致：横屏启动、锁定横屏（左右两个方向都允许）
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .landscape }
     override var shouldAutorotate: Bool { true }
 
     // MARK: - 麦克风授权（iOS 15+ 必须显式同意，否则网页拿不到麦克风）

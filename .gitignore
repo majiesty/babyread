@@ -1,0 +1,5 @@
+App/www/audio/
+*.ipa
+Payload/
+build/
+BabyRead.xcodeproj/
